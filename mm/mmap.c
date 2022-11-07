@@ -53,6 +53,10 @@ int sysctl_overcommit_memory;
 
 
 // 检查进程是否有足够的空间去申请一个vma
+/**
+ * pages:需要申请的页框数
+ * return:1，true；0，false
+ */
 int vm_enough_memory(long pages)
 {
 	// free记录当前空闲的空间
@@ -96,7 +100,11 @@ int vm_enough_memory(long pages)
 }
 
 /* Remove one vm structure from the inode's i_mapping address space. */
-// 从inode映射的地址空间中的share空间删除一个vma
+// 从inode映射的vma地址空间中的共享内存部分删除一个vma
+/**
+ * vma:需要删除的vma
+ * return:void
+ */
 static inline void __remove_shared_vm_struct(struct vm_area_struct *vma)
 {
 	struct file * file = vma->vm_file;
@@ -108,6 +116,7 @@ static inline void __remove_shared_vm_struct(struct vm_area_struct *vma)
 			atomic_inc(&inode->i_writecount);
 			
 		// 双向链表删除操作，后连前，前连后
+        // TODO 为什么pprev定义为二级指针
 		if(vma->vm_next_share)
 			vma->vm_next_share->vm_pprev_share = vma->vm_pprev_share;
 		*vma->vm_pprev_share = vma->vm_next_share;
@@ -115,6 +124,10 @@ static inline void __remove_shared_vm_struct(struct vm_area_struct *vma)
 }
 
 // remove_shared_vma的加锁版本
+/**
+ * vma:删除的vma
+ * return:void
+ */
 static inline void remove_shared_vm_struct(struct vm_area_struct *vma)
 {
 	lock_vma_mappings(vma);
@@ -123,6 +136,10 @@ static inline void remove_shared_vm_struct(struct vm_area_struct *vma)
 }
 
 // 上锁
+/**
+ * vma:上锁的vma
+ * return:void
+ */
 void lock_vma_mappings(struct vm_area_struct *vma)
 {
 	struct address_space *mapping;
@@ -132,16 +149,20 @@ void lock_vma_mappings(struct vm_area_struct *vma)
 	// vm_file:vma指向的文件
 	// f_dentry:文件的目录项
 	// d_inode:目录项中记录的inode
-	// i_mapping:inode映射的地址空间
+	// i_mapping:inode映射的vma地址空间
 	if (vma->vm_file)
 		mapping = vma->vm_file->f_dentry->d_inode->i_mapping;
 		
-	// 将inode映射的地址空间上锁
+	// 将inode映射的vma共享地址空间上锁
 	if (mapping)
 		spin_lock(&mapping->i_shared_lock);
 }
 
 // 解锁，过程类似上锁
+/**
+ * vma:解锁的vma
+ * return:void
+ */
 void unlock_vma_mappings(struct vm_area_struct *vma)
 {
 	struct address_space *mapping;
@@ -161,6 +182,10 @@ void unlock_vma_mappings(struct vm_area_struct *vma)
  *  to invoke file system routines that need the global lock.
  */
  // 分配动态内存
+ /**
+  * brk:新分配的动态内存结束地址(起始地址固定)
+  * return:分配的动态内存结束地址，分配不成功时返回当前mm.brk
+  */
 asmlinkage unsigned long sys_brk(unsigned long brk)
 {
 	unsigned long rlim, retval;
@@ -259,8 +284,13 @@ static inline unsigned long calc_vm_flags(unsigned long prot, unsigned long flag
 #undef _trans
 }
 
+// 判断DEBUG_MM_RB宏是否被定义
 #ifdef DEBUG_MM_RB
-// 遍历红黑树，返回节点个数
+// 递归遍历红黑树
+/**
+ * rb_node:红黑树节点
+ * return:节点个数
+ */
 static int browse_rb(rb_node_t * rb_node) {
 	int i = 0;
 	if (rb_node) {
@@ -272,6 +302,10 @@ static int browse_rb(rb_node_t * rb_node) {
 }
 
 // 检查mm_struct是否合法
+/**
+ * mm:受检查的mm_struct
+ * return:void，出现bug时调用BUG()
+ */
 static void validate_mm(struct mm_struct * mm) {
 	// 是否有bug
 	int bug = 0;
@@ -299,10 +333,21 @@ static void validate_mm(struct mm_struct * mm) {
 		BUG();
 }
 #else
-// TODO
+// 若DEBUG_MM_RB未定义，则定义validata_mm(mm)为do {} while (0);
+// do {} while (0)的作用：将{}的代码分块，对于#ifdef分支来说，其中有一个代码块为do {} while (0);
+// 保证使用宏时无编译错误
 #define validate_mm(mm) do { } while (0)
 #endif
 
+// 查找包含addr地址的vma
+/**
+ * mm:被搜索的mm
+ * addr:目标addr
+ * pprev:待赋值的vma.pprev
+ * rb_link:待赋值的目标vma的rb_node
+ * rb_parent:待赋值的目标vma的rb_node.rb_parent
+ * return:查找到的vma
+ */
 static struct vm_area_struct * find_vma_prepare(struct mm_struct * mm, unsigned long addr,
 						struct vm_area_struct ** pprev,
 						rb_node_t *** rb_link, rb_node_t ** rb_parent)
@@ -310,18 +355,30 @@ static struct vm_area_struct * find_vma_prepare(struct mm_struct * mm, unsigned 
 	struct vm_area_struct * vma;
 	rb_node_t ** __rb_link, * __rb_parent, * rb_prev;
 
+    // __rb_link变量存储当前mm的红黑树根节点
+    // mm_rb: rb_root_s 根节点结构体
+    // rb_node: rb_node_s 实际的节点结构体
 	__rb_link = &mm->mm_rb.rb_node;
+
+    // rb_prev随__rb_parent变化
 	rb_prev = __rb_parent = NULL;
 	vma = NULL;
 
+    // 若根节点不为空
 	while (*__rb_link) {
 		struct vm_area_struct *vma_tmp;
 
 		__rb_parent = *__rb_link;
+
+        // rb_entry (type *)((char *)(ptr)-(unsigned long)(&((type *)0)->member))
+        // (struct vma*)((char*)__rb_parent - (ul)(&((vma*)0)->vm_rb))
+        // 获得包含__rb_parent的vma
 		vma_tmp = rb_entry(__rb_parent, struct vm_area_struct, vm_rb);
 
+        // 搜索树查找
 		if (vma_tmp->vm_end > addr) {
 			vma = vma_tmp;
+            // 若vma_tmp包含addr，直接返回
 			if (vma_tmp->vm_start <= addr)
 				return vma;
 			__rb_link = &__rb_parent->rb_left;
@@ -331,7 +388,9 @@ static struct vm_area_struct * find_vma_prepare(struct mm_struct * mm, unsigned 
 		}
 	}
 
+    // 到达此处说明红黑树中没有，__rb_parent指向路径的最后一个节点，vma为对应的vma
 	*pprev = NULL;
+    // 若当前vma包含前驱结点则赋值
 	if (rb_prev)
 		*pprev = rb_entry(rb_prev, struct vm_area_struct, vm_rb);
 	*rb_link = __rb_link;
@@ -339,14 +398,25 @@ static struct vm_area_struct * find_vma_prepare(struct mm_struct * mm, unsigned 
 	return vma;
 }
 
+// 将vma插入到list和rbtree中
+/**
+ * mm:被处理的mm_struct
+ * vma:插入的vma
+ * prev:插入位置的前驱vma
+ * rb_parent:插入位置对应的前驱rb_node
+ * return:void
+ */
 static inline void __vma_link_list(struct mm_struct * mm, struct vm_area_struct * vma, struct vm_area_struct * prev,
 				   rb_node_t * rb_parent)
 {
+    // 若有前驱vma
 	if (prev) {
 		vma->vm_next = prev->vm_next;
 		prev->vm_next = vma;
-	} else {
+	} else { // 若没有前驱vma，则当前vma为list的第一个
 		mm->mmap = vma;
+        // 若存在rb_parent，则将rb_parent对应的vma接在后面
+        // TODO ???链表和红黑树的节点个数不一致？
 		if (rb_parent)
 			vma->vm_next = rb_entry(rb_parent, struct vm_area_struct, vm_rb);
 		else
@@ -354,38 +424,72 @@ static inline void __vma_link_list(struct mm_struct * mm, struct vm_area_struct 
 	}
 }
 
+// 红黑树调整操作
+/**
+ * mm:被处理的mm
+ * vma:需要调整的vma
+ * rb_link:需要调整的rb_node
+ * rb_parent:rb_link.rb_parent
+ * return:void
+ */
 static inline void __vma_link_rb(struct mm_struct * mm, struct vm_area_struct * vma,
 				 rb_node_t ** rb_link, rb_node_t * rb_parent)
 {
+    // 红黑树性质的设置
 	rb_link_node(&vma->vm_rb, rb_parent, rb_link);
+    // 红黑树性质调整
 	rb_insert_color(&vma->vm_rb, &mm->mm_rb);
 }
 
+// vma连接文件处理
+/**
+ * vma:被连接的vma
+ * return:void
+ */
 static inline void __vma_link_file(struct vm_area_struct * vma)
 {
 	struct file * file;
 
+    // vma映射的文件
 	file = vma->vm_file;
 	if (file) {
+        // 文件所属的inode
 		struct inode * inode = file->f_dentry->d_inode;
+        // inode的映射空间
 		struct address_space *mapping = inode->i_mapping;
 		struct vm_area_struct **head;
 
+        // 文件繁忙不允许写，i_writecount递减
 		if (vma->vm_flags & VM_DENYWRITE)
 			atomic_dec(&inode->i_writecount);
 
+        // inode映射的vma私有地址空间(表头)
 		head = &mapping->i_mmap;
+        // 若当前vma的标志位为共享，则设置head为vma共享地址空间(表头)
 		if (vma->vm_flags & VM_SHARED)
 			head = &mapping->i_mmap_shared;
       
 		/* insert vma into inode's share list */
+        // 将表头设置为vma的下一个共享节点
 		if((vma->vm_next_share = *head) != NULL)
+            // 将vma的下一个共享节点的pprev设为自身
 			(*head)->vm_pprev_share = &vma->vm_next_share;
+
+        // 将vma的pprev设为自身，表头设为vma
 		*head = vma;
 		vma->vm_pprev_share = head;
 	}
 }
 
+// 向mm中的vma空间添加vma的聚合操作
+/**
+ * mm:被处理的mm
+ * vma:添加的vma
+ * prev:添加位置的前驱vma
+ * rb_link:目标vma的rb_node
+ * rb_parent:目标vma的rb_node.rb_parent
+ * return:void
+ */
 static void __vma_link(struct mm_struct * mm, struct vm_area_struct * vma,  struct vm_area_struct * prev,
 		       rb_node_t ** rb_link, rb_node_t * rb_parent)
 {
@@ -394,36 +498,72 @@ static void __vma_link(struct mm_struct * mm, struct vm_area_struct * vma,  stru
 	__vma_link_file(vma);
 }
 
+// 在__vma_link的基础上进行加锁和验证
+/**
+ * mm:被处理的mm
+ * vma:添加的vma
+ * prev:添加位置的前驱vma
+ * rb_link:目标vma的rb_node
+ * rb_parent:目标vma的rb_node.rb_parent
+ * return:void
+ */
 static inline void vma_link(struct mm_struct * mm, struct vm_area_struct * vma, struct vm_area_struct * prev,
 			    rb_node_t ** rb_link, rb_node_t * rb_parent)
 {
+    // 锁进程vma
 	lock_vma_mappings(vma);
+    // 锁页表
 	spin_lock(&mm->page_table_lock);
 	__vma_link(mm, vma, prev, rb_link, rb_parent);
 	spin_unlock(&mm->page_table_lock);
 	unlock_vma_mappings(vma);
 
+    // 增加计数并验证
 	mm->map_count++;
 	validate_mm(mm);
 }
 
+// 合并vma
+/**
+ * mm:被处理的mm_struct
+ * prev:合并区间的前一个vma
+ * rb_parent:红黑树中合并区间的前一个rb_node
+ * addr:合并区间起始地址
+ * end:合并区间结束地址
+ * vm_flags:vma权限
+ * return:1，成功;0，失败
+ */
 static int vma_merge(struct mm_struct * mm, struct vm_area_struct * prev,
 		     rb_node_t * rb_parent, unsigned long addr, unsigned long end, unsigned long vm_flags)
 {
+    // prev 为前一个vma
+    // addr、end表示合并的地址区间
+
 	spinlock_t * lock = &mm->page_table_lock;
+
+    // 若prev为空，则获取rb_parent对应的vma
 	if (!prev) {
 		prev = rb_entry(rb_parent, struct vm_area_struct, vm_rb);
 		goto merge_next;
 	}
+
+    // 若两个vma边界重合，并且前一个vma允许merge
 	if (prev->vm_end == addr && can_vma_merge(prev, vm_flags)) {
 		struct vm_area_struct * next;
 
+        // 上锁
 		spin_lock(lock);
+        // 扩展prev边界
 		prev->vm_end = end;
 		next = prev->vm_next;
+        // 获取后一个vma，若边界重合且允许merge
 		if (next && prev->vm_end == next->vm_start && can_vma_merge(next, vm_flags)) {
+            // 扩展边界
 			prev->vm_end = next->vm_end;
+            // 删除next vma
 			__vma_unlink(mm, next, prev);
+
+            // 解锁，计数-1，清除cache
 			spin_unlock(lock);
 
 			mm->map_count--;
@@ -434,13 +574,18 @@ static int vma_merge(struct mm_struct * mm, struct vm_area_struct * prev,
 		return 1;
 	}
 
+    // 若边界不重合
 	prev = prev->vm_next;
 	if (prev) {
  merge_next:
+        // 若不允许merge，直接return
 		if (!can_vma_merge(prev, vm_flags))
 			return 0;
+
+        // 若下一个vma的start为合并区间的end，即合并区间不在prev->next里
 		if (end == prev->vm_start) {
 			spin_lock(lock);
+            // 扩展下一个vma的起始地址
 			prev->vm_start = addr;
 			spin_unlock(lock);
 			return 1;
@@ -450,6 +595,7 @@ static int vma_merge(struct mm_struct * mm, struct vm_area_struct * prev,
 	return 0;
 }
 
+// do_mmap核心函数
 unsigned long do_mmap_pgoff(struct file * file, unsigned long addr, unsigned long len,
 	unsigned long prot, unsigned long flags, unsigned long pgoff)
 {
@@ -648,6 +794,11 @@ free_vma:
  * This function "knows" that -ENOMEM has the bits set.
  */
 #ifndef HAVE_ARCH_UNMAPPED_AREA
+
+// 获取空闲vma地址-架构实现
+/**
+ * filp:被映射的file
+ */
 static inline unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags)
 {
 	struct vm_area_struct *vma;
@@ -656,8 +807,10 @@ static inline unsigned long arch_get_unmapped_area(struct file *filp, unsigned l
 		return -ENOMEM;
 
 	if (addr) {
+        // 将addr对齐后find_vma查找第一个满足addr < vm_end的vma
 		addr = PAGE_ALIGN(addr);
 		vma = find_vma(current->mm, addr);
+
 		if (TASK_SIZE - len >= addr &&
 		    (!vma || addr + len <= vma->vm_start))
 			return addr;
@@ -677,6 +830,8 @@ static inline unsigned long arch_get_unmapped_area(struct file *filp, unsigned l
 extern unsigned long arch_get_unmapped_area(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
 #endif	
 
+// 获取空闲vma地址
+
 unsigned long get_unmapped_area(struct file *file, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags)
 {
 	if (flags & MAP_FIXED) {
@@ -694,6 +849,11 @@ unsigned long get_unmapped_area(struct file *file, unsigned long addr, unsigned 
 }
 
 /* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
+// 查找第一个满足addr < vm_end的vma
+/**
+ * mm:被查找的mm_struct
+ * addr:目标地址
+ */
 struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr)
 {
 	struct vm_area_struct *vma = NULL;
@@ -701,7 +861,9 @@ struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr)
 	if (mm) {
 		/* Check the cache first. */
 		/* (Cache hit rate is typically around 35%.) */
+        // 首先查看cache，cache为上一次find_vma的结果
 		vma = mm->mmap_cache;
+        // 若cache不满足则红黑树搜索，满足直接返回
 		if (!(vma && vma->vm_end > addr && vma->vm_start <= addr)) {
 			rb_node_t * rb_node;
 
@@ -713,14 +875,17 @@ struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr)
 
 				vma_tmp = rb_entry(rb_node, struct vm_area_struct, vm_rb);
 
+                // addr < end，往左查找
 				if (vma_tmp->vm_end > addr) {
 					vma = vma_tmp;
+                    // 满足条件直接break
 					if (vma_tmp->vm_start <= addr)
 						break;
 					rb_node = rb_node->rb_left;
-				} else
+				} else // addr >= end，往右查找
 					rb_node = rb_node->rb_right;
 			}
+            // 将查找结果存入cache
 			if (vma)
 				mm->mmap_cache = vma;
 		}
@@ -905,6 +1070,7 @@ static struct vm_area_struct * unmap_fixup(struct mm_struct *mm,
  * "prev", if it exists, points to a vma before the one
  * we just free'd - but there's no telling how much before.
  */
+// 释放页表项
 static void free_pgtables(struct mm_struct * mm, struct vm_area_struct *prev,
 	unsigned long start, unsigned long end)
 {
@@ -955,6 +1121,7 @@ no_mmaps:
  * work.  This now handles partial unmappings.
  * Jeremy Fitzhardine <jeremy@sw.oz.au>
  */
+// 销毁虚拟内存映射
 int do_munmap(struct mm_struct *mm, unsigned long addr, size_t len)
 {
 	struct vm_area_struct *mpnt, *prev, **npp, *free, *extra;
@@ -1048,6 +1215,7 @@ int do_munmap(struct mm_struct *mm, unsigned long addr, size_t len)
 	return 0;
 }
 
+// 系统调用，销毁虚拟内存映射
 asmlinkage long sys_munmap(unsigned long addr, size_t len)
 {
 	int ret;
@@ -1064,6 +1232,7 @@ asmlinkage long sys_munmap(unsigned long addr, size_t len)
  *  anonymous maps.  eventually we may be able to do some
  *  brk-specific accounting here.
  */
+// 分配动态内存
 unsigned long do_brk(unsigned long addr, unsigned long len)
 {
 	struct mm_struct * mm = current->mm;
@@ -1145,6 +1314,7 @@ out:
 }
 
 /* Build the RB tree corresponding to the VMA list. */
+// 根据vma list建红黑树
 void build_mmap_rb(struct mm_struct * mm)
 {
 	struct vm_area_struct * vma;
@@ -1161,6 +1331,7 @@ void build_mmap_rb(struct mm_struct * mm)
 }
 
 /* Release all mmaps. */
+// 销毁所有映射
 void exit_mmap(struct mm_struct * mm)
 {
 	struct vm_area_struct * mpnt;
@@ -1207,6 +1378,7 @@ void exit_mmap(struct mm_struct * mm)
  * and into the inode's i_mmap ring.  If vm_file is non-NULL
  * then the i_shared_lock must be held here.
  */
+// 插入vma
 void __insert_vm_struct(struct mm_struct * mm, struct vm_area_struct * vma)
 {
 	struct vm_area_struct * __vma, * prev;
