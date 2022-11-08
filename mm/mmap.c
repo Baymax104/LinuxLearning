@@ -342,7 +342,7 @@ static void validate_mm(struct mm_struct * mm) {
 // 查找包含addr地址的vma
 /**
  * mm:被搜索的mm
- * addr:目标addr
+ * addr:开始查找的addr
  * pprev:待赋值的vma.pprev
  * rb_link:待赋值的目标vma的rb_node
  * rb_parent:待赋值的目标vma的rb_node.rb_parent
@@ -360,7 +360,6 @@ static struct vm_area_struct * find_vma_prepare(struct mm_struct * mm, unsigned 
     // rb_node: rb_node_s 实际的节点结构体
 	__rb_link = &mm->mm_rb.rb_node;
 
-    // rb_prev随__rb_parent变化
 	rb_prev = __rb_parent = NULL;
 	vma = NULL;
 
@@ -372,29 +371,46 @@ static struct vm_area_struct * find_vma_prepare(struct mm_struct * mm, unsigned 
 
         // rb_entry (type *)((char *)(ptr)-(unsigned long)(&((type *)0)->member))
         // (struct vma*)((char*)__rb_parent - (ul)(&((vma*)0)->vm_rb))
-        // 获得包含__rb_parent的vma
+        // 获得包含__rb_parent的vma，即__rb_parent对应的vma
 		vma_tmp = rb_entry(__rb_parent, struct vm_area_struct, vm_rb);
 
         // 搜索树查找
-		if (vma_tmp->vm_end > addr) {
+		if (vma_tmp->vm_end > addr) { // 查找左子树
 			vma = vma_tmp;
             // 若vma_tmp包含addr，直接返回
 			if (vma_tmp->vm_start <= addr)
+                // 若vma包含addr，则不设置pprev
 				return vma;
 			__rb_link = &__rb_parent->rb_left;
-		} else {
+		} else { // 查找右子树，rb_prev记录当前节点
 			rb_prev = __rb_parent;
 			__rb_link = &__rb_parent->rb_right;
 		}
 	}
 
-    // 到达此处说明红黑树中没有，__rb_parent指向路径的最后一个节点，vma为对应的vma
+    // 到达此处说明红黑树中没有，__rb_link为__rb_parent的后继前驱节点(右子树中最小的节点)
+    // 链表序中__rb_parent.next = __rb_link
+    // vma为对应的vma，vma.vm_start > addr
+
+    // 与find_vma_prev的不同
+    // find_vma_prev需要考虑查找节点与它的子节点形成的前驱后继关系以及查找节点与祖先节点构成的后继前驱关系
+    // find_vma_prepare用于查找插入位置的前驱节点，不需要考虑查找节点与它的子节点形成的前驱后继关系
+    // 查找插入位置说明目标vma不存在，只需要记录rb_prev的状态
+    // rb_prev的状态出现在两种情况下
+    // 1.__rb_link总是向左查找时，rb_prev为空
+    // 2.__rb_link存在向右查找时，rb_prev不为空，值为查找右子树时的根节点
 	*pprev = NULL;
-    // 若当前vma包含前驱结点则赋值
+    // 若rb_prev为空，则查找到的vma为红黑树中左子树的节点，不是任何一个节点的后继前驱节点
+    // 若rb_prev不为空，则vma属于某个节点的右子树，rb_prev记录该节点
+    // TODO rb_prev = __rb_parent，不知道为什么设置两个变量
 	if (rb_prev)
+        // 赋值rb_prev对应的vma
+        // 地址满足以下关系
+        // pprev.vm_end < addr < vma.vm_start < vma.vm_end
 		*pprev = rb_entry(rb_prev, struct vm_area_struct, vm_rb);
 	*rb_link = __rb_link;
 	*rb_parent = __rb_parent;
+    // 若vma不包含addr，则设置pprev表示包含区间
 	return vma;
 }
 
@@ -410,13 +426,17 @@ static inline void __vma_link_list(struct mm_struct * mm, struct vm_area_struct 
 				   rb_node_t * rb_parent)
 {
     // 若有前驱vma
+    // 若链表中有前驱vma，则红黑树中vma为prev的后继前驱节点
 	if (prev) {
+        // 单链表插入
 		vma->vm_next = prev->vm_next;
 		prev->vm_next = vma;
-	} else { // 若没有前驱vma，则当前vma为list的第一个
+        // 此处只是插入链表，后续会调用__vma_link_rb在红黑树中插入
+	} else { // 若没有前驱vma，则当前vma为list的第一个，头插
 		mm->mmap = vma;
         // 若存在rb_parent，则将rb_parent对应的vma接在后面
-        // TODO ???链表和红黑树的节点个数不一致？
+        // 链表序中，vma为第一个，则红黑树中的所有节点都比vma大，vma为红黑树中最左的节点
+        // rb_parent为插入位置的父节点，通过rb_parent获取vma
 		if (rb_parent)
 			vma->vm_next = rb_entry(rb_parent, struct vm_area_struct, vm_rb);
 		else
@@ -424,7 +444,7 @@ static inline void __vma_link_list(struct mm_struct * mm, struct vm_area_struct 
 	}
 }
 
-// 红黑树调整操作
+// 红黑树插入操作
 /**
  * mm:被处理的mm
  * vma:需要调整的vma
@@ -435,7 +455,7 @@ static inline void __vma_link_list(struct mm_struct * mm, struct vm_area_struct 
 static inline void __vma_link_rb(struct mm_struct * mm, struct vm_area_struct * vma,
 				 rb_node_t ** rb_link, rb_node_t * rb_parent)
 {
-    // 红黑树性质的设置
+    // 插入红黑树
 	rb_link_node(&vma->vm_rb, rb_parent, rb_link);
     // 红黑树性质调整
 	rb_insert_color(&vma->vm_rb, &mm->mm_rb);
@@ -471,6 +491,7 @@ static inline void __vma_link_file(struct vm_area_struct * vma)
       
 		/* insert vma into inode's share list */
         // 将表头设置为vma的下一个共享节点
+        // TODO 为什么将next_share设为表头
 		if((vma->vm_next_share = *head) != NULL)
             // 将vma的下一个共享节点的pprev设为自身
 			(*head)->vm_pprev_share = &vma->vm_next_share;
@@ -596,6 +617,15 @@ static int vma_merge(struct mm_struct * mm, struct vm_area_struct * prev,
 }
 
 // do_mmap核心函数
+/**
+ * file:被映射的file
+ * addr:开始映射的线性区地址
+ * len:映射长度
+ * prot:访问权限
+ * flags:映射标志
+ * pgoff:文件偏移量
+ * return:映射线性区起始地址(成功返回addr)
+ */
 unsigned long do_mmap_pgoff(struct file * file, unsigned long addr, unsigned long len,
 	unsigned long prot, unsigned long flags, unsigned long pgoff)
 {
@@ -798,11 +828,17 @@ free_vma:
 // 获取空闲vma地址-架构实现
 /**
  * filp:被映射的file
+ * addr:开始查找的addr
+ * len:映射长度
+ * pgoff:文件的偏移量
+ * flags:映射标志
+ * return:空闲vma的起始地址
  */
 static inline unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags)
 {
 	struct vm_area_struct *vma;
 
+    // 若映射长度大于进程size
 	if (len > TASK_SIZE)
 		return -ENOMEM;
 
@@ -811,12 +847,16 @@ static inline unsigned long arch_get_unmapped_area(struct file *filp, unsigned l
 		addr = PAGE_ALIGN(addr);
 		vma = find_vma(current->mm, addr);
 
+        // 若查找到的vma不合法，为空或者起始地址不在addr+len内
+        // 直接返回addr
 		if (TASK_SIZE - len >= addr &&
 		    (!vma || addr + len <= vma->vm_start))
 			return addr;
 	}
+    // 将addr对齐后再次查找
 	addr = PAGE_ALIGN(TASK_UNMAPPED_BASE);
 
+    // 从第一个addr < vm_end的vma开始，直到查找到合法的vma
 	for (vma = find_vma(current->mm, addr); ; vma = vma->vm_next) {
 		/* At this point:  (!vma || addr < vma->vm_end). */
 		if (TASK_SIZE - len < addr)
@@ -831,9 +871,17 @@ extern unsigned long arch_get_unmapped_area(struct file *, unsigned long, unsign
 #endif	
 
 // 获取空闲vma地址
-
+/**
+ * file:被映射的file
+ * addr:开始查找的addr
+ * len:映射长度
+ * pgoff:文件内的偏移量
+ * flags:映射标志
+ * return:空闲vma的起始地址
+ */
 unsigned long get_unmapped_area(struct file *file, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags)
 {
+    // flags检查
 	if (flags & MAP_FIXED) {
 		if (addr > TASK_SIZE - len)
 			return -ENOMEM;
@@ -842,9 +890,11 @@ unsigned long get_unmapped_area(struct file *file, unsigned long addr, unsigned 
 		return addr;
 	}
 
+    // 若文件存在且操作集中包含get_unmapped_area函数，执行文件的get_unmapped_are
 	if (file && file->f_op && file->f_op->get_unmapped_area)
 		return file->f_op->get_unmapped_area(file, addr, len, pgoff, flags);
 
+    // 否则执行架构实现的get_unmapped_area
 	return arch_get_unmapped_area(file, addr, len, pgoff, flags);
 }
 
@@ -852,7 +902,7 @@ unsigned long get_unmapped_area(struct file *file, unsigned long addr, unsigned 
 // 查找第一个满足addr < vm_end的vma
 /**
  * mm:被查找的mm_struct
- * addr:目标地址
+ * addr:目标地址(addr不一定落在vma内)
  */
 struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr)
 {
@@ -894,14 +944,23 @@ struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr)
 }
 
 /* Same as find_vma, but also return a pointer to the previous VMA in *pprev. */
+// 搜索包含addr
+/**
+ * mm:被搜索的mm_struct
+ * addr:开始查找的addr
+ * pprev:查找到的vma的pprev(待赋值)
+ * return:查找到的vma
+ */
 struct vm_area_struct * find_vma_prev(struct mm_struct * mm, unsigned long addr,
 				      struct vm_area_struct **pprev)
 {
 	if (mm) {
 		/* Go through the RB tree quickly. */
+        // 直接查找红黑树
 		struct vm_area_struct * vma;
 		rb_node_t * rb_node, * rb_last_right, * rb_prev;
-		
+
+        // rb_node为当前遍历到的节点
 		rb_node = mm->mm_rb.rb_node;
 		rb_last_right = rb_prev = NULL;
 		vma = NULL;
@@ -911,26 +970,52 @@ struct vm_area_struct * find_vma_prev(struct mm_struct * mm, unsigned long addr,
 
 			vma_tmp = rb_entry(rb_node, struct vm_area_struct, vm_rb);
 
+            // 查找左子树
 			if (vma_tmp->vm_end > addr) {
 				vma = vma_tmp;
 				rb_prev = rb_last_right;
 				if (vma_tmp->vm_start <= addr)
 					break;
 				rb_node = rb_node->rb_left;
-			} else {
+			} else { // 查找右子树
+                // rb_last_right记录右子树的父节点
 				rb_last_right = rb_node;
 				rb_node = rb_node->rb_right;
 			}
 		}
+        // 若vma为空，则vma为树中最右的节点，没有满足条件的vma，跳到return NULL;
+        // 若vma不为空的情况
+        // 1.经过break跳出，vma.vm_start <= addr < vma.vm_end，vma可能不是叶子节点
+        // 2.循环结束跳出，vma是第一个满足vm_start > addr的节点，vma一定是叶子节点
+        // rb_prev是否为空的rb_node状态
+        // rb_node总是向左查找或存在向右查找但不构成后继前驱关系时，rb_prev为空
+        // rb_node存在向右查找且构成后继前驱关系时，rb_prev不为空
 		if (vma) {
+            // 结合上面的情况，会产生四种状态
+            // 1.rb_prev为空，vma没有左子树
+            //   此时rb_node为红黑树中最左的节点，vm_end最小的节点，对应链表中的第一个节点
+            // 2.rb_prev为空，vma有左子树
+            //   此时rb_node总是向左查找但vma不是最左的节点，是第一个vm_end > addr的节点
+            // 3.rb_prev不为空，vma没有左子树
+            //   此时rb_node一定为叶节点，vma为rb_prev的后继前驱节点
+            // 4.rb_prev不为空，vma有左子树
+            //   此时vma一定包含addr，含有左子树说明存在vm_end大于rb_prev小于vma的节点，依然更新rb_prev
+
+            // 若rb_node有左子树，查找前驱后继节点
 			if (vma->vm_rb.rb_left) {
+                // rb_prev移动到rb_node左子树中的最右节点
 				rb_prev = vma->vm_rb.rb_left;
 				while (rb_prev->rb_right)
 					rb_prev = rb_prev->rb_right;
 			}
 			*pprev = NULL;
 			if (rb_prev)
+                // rb_prev不为空则*pprev设为rb_prev对应的vma
+                // rb_prev为vm_end小于vma.vm_end的最大节点(类似二分查找，在链表上顺序排在vma之前)
+                // 二叉搜索树的中序与链表升序一致
 				*pprev = rb_entry(rb_prev, struct vm_area_struct, vm_rb);
+            // 检查链表上的顺序，即pprev.next=vma
+            // 若rb_prev为空，则vma为链表的表头
 			if ((rb_prev ? (*pprev)->vm_next : mm->mmap) != vma)
 				BUG();
 			return vma;
@@ -940,19 +1025,31 @@ struct vm_area_struct * find_vma_prev(struct mm_struct * mm, unsigned long addr,
 	return NULL;
 }
 
+// 查找第一个扩展的vma，可扩展的vma为addr < vma.vm_start,addr < vma.vm_end
+/**
+ * mm:被查找的mm_struct
+ * addr:开始查找的地址
+ * return:被扩展的vma
+ */
 struct vm_area_struct * find_extend_vma(struct mm_struct * mm, unsigned long addr)
 {
 	struct vm_area_struct * vma;
 	unsigned long start;
 
+    // 将addr对齐页框
 	addr &= PAGE_MASK;
+    // 查找第一个vm_end > addr的vma
 	vma = find_vma(mm,addr);
 	if (!vma)
 		return NULL;
+    // 若vma包含addr，直接返回vma
 	if (vma->vm_start <= addr)
 		return vma;
+    // 若vma的标志不是可向下扩展的，直接返回
+    // 栈向下扩展，堆向上扩展，上方向为高地址
 	if (!(vma->vm_flags & VM_GROWSDOWN))
 		return NULL;
+    // 扩展vma
 	start = vma->vm_start;
 	if (expand_stack(vma, addr))
 		return NULL;
@@ -985,6 +1082,7 @@ struct vm_area_struct * find_extend_vma(struct mm_struct * mm, unsigned long add
  * allocate a new one, and the return indicates whether the old
  * area was reused.
  */
+// 修正未映射区域
 static struct vm_area_struct * unmap_fixup(struct mm_struct *mm, 
 	struct vm_area_struct *area, unsigned long addr, size_t len, 
 	struct vm_area_struct *extra)
@@ -1216,6 +1314,11 @@ int do_munmap(struct mm_struct *mm, unsigned long addr, size_t len)
 }
 
 // 系统调用，销毁虚拟内存映射
+/**
+ * addr:销毁的线性区起始地址
+ * len:映射长度
+ * return:TODO
+ */
 asmlinkage long sys_munmap(unsigned long addr, size_t len)
 {
 	int ret;
@@ -1315,14 +1418,21 @@ out:
 
 /* Build the RB tree corresponding to the VMA list. */
 // 根据vma list建红黑树
+/**
+ * mm:建树的mm_struct
+ * return:void
+ */
 void build_mmap_rb(struct mm_struct * mm)
 {
 	struct vm_area_struct * vma;
 	rb_node_t ** rb_link, * rb_parent;
 
+    // RB_ROOT:rb_node_t结构
 	mm->mm_rb = RB_ROOT;
 	rb_link = &mm->mm_rb.rb_node;
 	rb_parent = NULL;
+    // 遍历vma链表，每个节点调用__vma_link_rb插入到红黑树中
+    // 链表升序，红黑树总是从右节点插入
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {
 		__vma_link_rb(mm, vma, rb_link, rb_parent);
 		rb_parent = &vma->vm_rb;
@@ -1332,6 +1442,10 @@ void build_mmap_rb(struct mm_struct * mm)
 
 /* Release all mmaps. */
 // 销毁所有映射
+/**
+ * mm:待销毁映射的mm_struct
+ * return:void
+ */
 void exit_mmap(struct mm_struct * mm)
 {
 	struct vm_area_struct * mpnt;
@@ -1379,19 +1493,34 @@ void exit_mmap(struct mm_struct * mm)
  * then the i_shared_lock must be held here.
  */
 // 插入vma
+/**
+ * mm:被插入的mm_struct
+ * vma:插入的vma
+ * return:void
+ */
 void __insert_vm_struct(struct mm_struct * mm, struct vm_area_struct * vma)
 {
 	struct vm_area_struct * __vma, * prev;
 	rb_node_t ** rb_link, * rb_parent;
 
+    // 查找插入位置的前一个vma，以vma.vm_start为查找的起始地址
 	__vma = find_vma_prepare(mm, vma->vm_start, &prev, &rb_link, &rb_parent);
+    // 若vma已存在，则返回__vma不为空且__vma在vma之前或__vma == vma
 	if (__vma && __vma->vm_start < vma->vm_end)
 		BUG();
+    // vma不存在，此时，prev不为空，vma.vm_end <= __vma.vm_start
 	__vma_link(mm, vma, prev, rb_link, rb_parent);
+    // 增加计数并验证
 	mm->map_count++;
 	validate_mm(mm);
 }
 
+// 插入vma，实现同__insert_vm_struct
+/**
+ * mm:被插入的mm_struct
+ * vma:插入的vma
+ * return:void
+ */
 void insert_vm_struct(struct mm_struct * mm, struct vm_area_struct * vma)
 {
 	struct vm_area_struct * __vma, * prev;
