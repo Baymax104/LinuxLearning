@@ -116,7 +116,6 @@ static inline void __remove_shared_vm_struct(struct vm_area_struct *vma)
 			atomic_inc(&inode->i_writecount);
 			
 		// 双向链表删除操作，后连前，前连后
-        // TODO 为什么pprev定义为二级指针
 		if(vma->vm_next_share)
 			vma->vm_next_share->vm_pprev_share = vma->vm_pprev_share;
 		*vma->vm_pprev_share = vma->vm_next_share;
@@ -339,7 +338,7 @@ static void validate_mm(struct mm_struct * mm) {
 #define validate_mm(mm) do { } while (0)
 #endif
 
-// 查找包含addr地址的vma
+// 查找插入位置的前一个vma
 /**
  * mm:被搜索的mm
  * addr:开始查找的addr
@@ -629,34 +628,46 @@ static int vma_merge(struct mm_struct * mm, struct vm_area_struct * prev,
 unsigned long do_mmap_pgoff(struct file * file, unsigned long addr, unsigned long len,
 	unsigned long prot, unsigned long flags, unsigned long pgoff)
 {
+    // 获取当前mm_struct
 	struct mm_struct * mm = current->mm;
+
 	struct vm_area_struct * vma, * prev;
 	unsigned int vm_flags;
+    // 初始共享该vma的进程数为0
 	int correct_wcount = 0;
 	int error;
 	rb_node_t ** rb_link, * rb_parent;
 
+    // 检查file是否含有mmap函数
 	if (file && (!file->f_op || !file->f_op->mmap))
 		return -ENODEV;
 
+    // 将len对齐，len的值为映射的所有页框的长度
+    // 若映射长度不超过一个页框，则返回addr作为起始地址
 	if ((len = PAGE_ALIGN(len)) == 0)
 		return addr;
 
+    // 若映射长度超过进程用户空间，错误
 	if (len > TASK_SIZE)
 		return -EINVAL;
 
 	/* offset overflow? */
+    // len << PAGE_SHIFT为映射的页框个数
+    // 判断文件偏移量是否溢出，即页框个数是否是负数
 	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)
 		return -EINVAL;
 
 	/* Too many mappings? */
+    // 若当前映射数大于最大映射数，错误
 	if (mm->map_count > MAX_MAP_COUNT)
 		return -ENOMEM;
 
 	/* Obtain the address to map to. we verify (or select) it and ensure
 	 * that it represents a valid section of the address space.
 	 */
+    // 从addr开始查找未映射的区域的起始地址
 	addr = get_unmapped_area(file, addr, len, pgoff, flags);
+    // TODO addr在页框中
 	if (addr & ~PAGE_MASK)
 		return addr;
 
@@ -664,17 +675,23 @@ unsigned long do_mmap_pgoff(struct file * file, unsigned long addr, unsigned lon
 	 * to. we assume access permissions have been handled by the open
 	 * of the memory object, so we don't do any here.
 	 */
+    // 合并标志信息
 	vm_flags = calc_vm_flags(prot,flags) | mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
 
 	/* mlock MCL_FUTURE? */
+    // 若vma标志为上锁状态
 	if (vm_flags & VM_LOCKED) {
+        // 获取当前上锁的vma拥有的页框数
 		unsigned long locked = mm->locked_vm << PAGE_SHIFT;
+        // 加上当前需要映射的页框数
 		locked += len;
+        // 检查资源分配
 		if (locked > current->rlim[RLIMIT_MEMLOCK].rlim_cur)
 			return -EAGAIN;
 	}
 
 	if (file) {
+        // 若映射的是文件，检查映射类型及权限
 		switch (flags & MAP_TYPE) {
 		case MAP_SHARED:
 			if ((prot & PROT_WRITE) && !(file->f_mode & FMODE_WRITE))
@@ -702,6 +719,7 @@ unsigned long do_mmap_pgoff(struct file * file, unsigned long addr, unsigned lon
 			return -EINVAL;
 		}
 	} else {
+        // 若映射的是进程其他段
 		vm_flags |= VM_SHARED | VM_MAYSHARE;
 		switch (flags & MAP_TYPE) {
 		default:
@@ -717,7 +735,10 @@ unsigned long do_mmap_pgoff(struct file * file, unsigned long addr, unsigned lon
 	/* Clear old maps */
 	error = -ENOMEM;
 munmap_back:
+    // 查找插入位置
 	vma = find_vma_prepare(mm, addr, &prev, &rb_link, &rb_parent);
+    // 若vma包含addr+len，则销毁[addr,addr+len]的映射
+    // 跳转到munmap_back直到找到合法的插入位置
 	if (vma && vma->vm_start < addr + len) {
 		if (do_munmap(mm, addr, len))
 			return -ENOMEM;
@@ -725,29 +746,36 @@ munmap_back:
 	}
 
 	/* Check against address space limit. */
+    // 检查资源分配
 	if ((mm->total_vm << PAGE_SHIFT) + len
 	    > current->rlim[RLIMIT_AS].rlim_cur)
 		return -ENOMEM;
 
 	/* Private writable mapping? Check memory availability.. */
+    // 检查是否有足够空间建立映射
 	if ((vm_flags & (VM_SHARED | VM_WRITE)) == VM_WRITE &&
 	    !(flags & MAP_NORESERVE)				 &&
 	    !vm_enough_memory(len >> PAGE_SHIFT))
 		return -ENOMEM;
 
 	/* Can we just expand an old anonymous mapping? */
+    // 尝试合并已有的匿名映射
+    // 匿名映射不映射实际的文件，用于映射用户进程请求分配的内存(malloc)
 	if (!file && !(vm_flags & VM_SHARED) && rb_parent)
 		if (vma_merge(mm, prev, rb_parent, addr, addr + len, vm_flags))
+            // 合并成功，跳转到out
 			goto out;
 
 	/* Determine the object being mapped and call the appropriate
 	 * specific mapper. the address has already been validated, but
 	 * not unmapped, but the maps are removed from the list.
 	 */
+    // 分配cache内存
 	vma = kmem_cache_alloc(vm_area_cachep, SLAB_KERNEL);
 	if (!vma)
 		return -ENOMEM;
 
+    // 设置vma属性
 	vma->vm_mm = mm;
 	vma->vm_start = addr;
 	vma->vm_end = addr + len;
@@ -759,24 +787,34 @@ munmap_back:
 	vma->vm_private_data = NULL;
 	vma->vm_raend = 0;
 
+    // 若当前映射到file
 	if (file) {
 		error = -EINVAL;
+        // 若vma为向上增长或向下增长
 		if (vm_flags & (VM_GROWSDOWN|VM_GROWSUP))
 			goto free_vma;
+        // 若vma拒绝写
 		if (vm_flags & VM_DENYWRITE) {
+            // 检查是否文件拒绝写
 			error = deny_write_access(file);
 			if (error)
 				goto free_vma;
+            // 文件允许写，则共享vma进程数为1
 			correct_wcount = 1;
 		}
 		vma->vm_file = file;
 		get_file(file);
+        // 执行file的映射操作
 		error = file->f_op->mmap(file, vma);
 		if (error)
+            // 错误在则销毁映射并释放vma
 			goto unmap_and_free_vma;
+        
 	} else if (flags & MAP_SHARED) {
+        // 若映射为共享映射，则建立一个共享映射
 		error = shmem_zero_setup(vma);
 		if (error)
+            // 错误则释放vma
 			goto free_vma;
 	}
 
@@ -785,29 +823,38 @@ munmap_back:
 	 * Answer: Yes, several device drivers can do it in their
 	 *         f_op->mmap method. -DaveM
 	 */
+    // 更新addr为vma.vm_start
 	addr = vma->vm_start;
 
+    // 将vma连接到mm的相关结构上
 	vma_link(mm, vma, prev, rb_link, rb_parent);
+    // 若共享进程大于0，则原子递增共享进程数
 	if (correct_wcount)
 		atomic_inc(&file->f_dentry->d_inode->i_writecount);
 
-out:	
+out:
+    // 增加vm页框计数
 	mm->total_vm += len >> PAGE_SHIFT;
+    // 若vma为上锁状态
 	if (vm_flags & VM_LOCKED) {
+        // 增加上锁页框计数
 		mm->locked_vm += len >> PAGE_SHIFT;
 		make_pages_present(addr, addr + len);
 	}
 	return addr;
 
 unmap_and_free_vma:
+    // 检查共享进程数
 	if (correct_wcount)
 		atomic_inc(&file->f_dentry->d_inode->i_writecount);
 	vma->vm_file = NULL;
 	fput(file);
 
 	/* Undo any partial mapping done by a device driver. */
+    // 移除进程用户空间页面
 	zap_page_range(mm, vma->vm_start, vma->vm_end - vma->vm_start);
 free_vma:
+    // 释放vma，返回错误
 	kmem_cache_free(vm_area_cachep, vma);
 	return error;
 }
@@ -825,20 +872,20 @@ free_vma:
  */
 #ifndef HAVE_ARCH_UNMAPPED_AREA
 
-// 获取空闲vma地址-架构实现
+// 获取未映射区域的起始地址-架构实现
 /**
  * filp:被映射的file
  * addr:开始查找的addr
  * len:映射长度
  * pgoff:文件的偏移量
  * flags:映射标志
- * return:空闲vma的起始地址
+ * return:未映射的区域的起始地址(vmas未覆盖的区域)
  */
 static inline unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags)
 {
 	struct vm_area_struct *vma;
 
-    // 若映射长度大于进程size
+    // 若映射长度大于进程用户空间
 	if (len > TASK_SIZE)
 		return -ENOMEM;
 
@@ -847,7 +894,7 @@ static inline unsigned long arch_get_unmapped_area(struct file *filp, unsigned l
 		addr = PAGE_ALIGN(addr);
 		vma = find_vma(current->mm, addr);
 
-        // 若查找到的vma不合法，为空或者起始地址不在addr+len内
+        // 若找不到vma或者vma不包含addr+len(不包含addr+len必定不包含addr)
         // 直接返回addr
 		if (TASK_SIZE - len >= addr &&
 		    (!vma || addr + len <= vma->vm_start))
@@ -870,14 +917,14 @@ static inline unsigned long arch_get_unmapped_area(struct file *filp, unsigned l
 extern unsigned long arch_get_unmapped_area(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
 #endif	
 
-// 获取空闲vma地址
+// 获取未映射区域的起始地址
 /**
  * file:被映射的file
  * addr:开始查找的addr
  * len:映射长度
  * pgoff:文件内的偏移量
  * flags:映射标志
- * return:空闲vma的起始地址
+ * return:未映射的区域的起始地址
  */
 unsigned long get_unmapped_area(struct file *file, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags)
 {
@@ -903,6 +950,7 @@ unsigned long get_unmapped_area(struct file *file, unsigned long addr, unsigned 
 /**
  * mm:被查找的mm_struct
  * addr:目标地址(addr不一定落在vma内)
+ * return:目标vma
  */
 struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr)
 {
@@ -940,6 +988,8 @@ struct vm_area_struct * find_vma(struct mm_struct * mm, unsigned long addr)
 				mm->mmap_cache = vma;
 		}
 	}
+    // 当vma = NULL时，mm中红黑树根不存在或者搜索树时总是向右查找，树中所有节点的vm_end都比addr小
+    // 当vma != NULL时，addr一定比vma.vm_end小，但addr和vma.vm_start的大小关系无法得知
 	return vma;
 }
 
@@ -1083,6 +1133,14 @@ struct vm_area_struct * find_extend_vma(struct mm_struct * mm, unsigned long add
  * area was reused.
  */
 // 修正未映射区域
+/**
+ * mm:mm_struct
+ * area:待处理的vma
+ * addr:起始地址
+ * len:映射长度
+ * extra:用于映射未映射区域的vma
+ * return:修正后新映射区域的vma
+ */
 static struct vm_area_struct * unmap_fixup(struct mm_struct *mm, 
 	struct vm_area_struct *area, unsigned long addr, size_t len, 
 	struct vm_area_struct *extra)
@@ -1095,6 +1153,7 @@ static struct vm_area_struct * unmap_fixup(struct mm_struct *mm,
 		area->vm_mm->locked_vm -= len >> PAGE_SHIFT;
 
 	/* Unmapping the whole area. */
+    // 若vma的映射的整个区域都将销毁，则清除vma的相关结构后返回
 	if (addr == area->vm_start && end == area->vm_end) {
 		if (area->vm_ops && area->vm_ops->close)
 			area->vm_ops->close(area);
@@ -1105,26 +1164,33 @@ static struct vm_area_struct * unmap_fixup(struct mm_struct *mm,
 	}
 
 	/* Work out to one of the ends. */
+    // 若销毁区域与vma的范围只有一个边界重合，则调整vma范围即可
 	if (end == area->vm_end) {
 		/*
 		 * here area isn't visible to the semaphore-less readers
 		 * so we don't need to update it under the spinlock.
 		 */
 		area->vm_end = addr;
+        // 上锁
 		lock_vma_mappings(area);
 		spin_lock(&mm->page_table_lock);
 	} else if (addr == area->vm_start) {
+        // 移动文件偏移量
 		area->vm_pgoff += (end - area->vm_start) >> PAGE_SHIFT;
 		/* same locking considerations of the above case */
 		area->vm_start = end;
+        // 上锁
 		lock_vma_mappings(area);
 		spin_lock(&mm->page_table_lock);
 	} else {
 	/* Unmapping a hole: area->vm_start < addr <= end < area->vm_end */
+    // 删除部分位于vma范围内部
 		/* Add end mapping -- leave beginning for below */
+        // 增加[end,vma.vm_end]部分的映射
 		mpnt = extra;
 		extra = NULL;
 
+        // 设置extra属性
 		mpnt->vm_mm = area->vm_mm;
 		mpnt->vm_start = end;
 		mpnt->vm_end = area->vm_end;
@@ -1139,19 +1205,27 @@ static struct vm_area_struct * unmap_fixup(struct mm_struct *mm,
 			get_file(mpnt->vm_file);
 		if (mpnt->vm_ops && mpnt->vm_ops->open)
 			mpnt->vm_ops->open(mpnt);
+
+        // 调整vma的end边界
 		area->vm_end = addr;	/* Truncate area */
 
 		/* Because mpnt->vm_file == area->vm_file this locks
 		 * things correctly.
 		 */
+        // 上锁
 		lock_vma_mappings(area);
 		spin_lock(&mm->page_table_lock);
+        // 插入新映射的vma
 		__insert_vm_struct(mm, mpnt);
 	}
 
+    // 插入处理后的原vma
+    // 流程的思路为将free list中的vma都先进行删除，然后传入fixup进行处理，处理完成后再插入回去
 	__insert_vm_struct(mm, area);
+    // 解锁
 	spin_unlock(&mm->page_table_lock);
 	unlock_vma_mappings(area);
+    // 若extra已使用，则extra为NULL，否则保留原值
 	return extra;
 }
 
@@ -1220,13 +1294,21 @@ no_mmaps:
  * Jeremy Fitzhardine <jeremy@sw.oz.au>
  */
 // 销毁虚拟内存映射
+/**
+ * mm:mm_struct
+ * addr:销毁映射的起始地址
+ * len:销毁的映射长度
+ * return:1:成功,0:失败
+ */
 int do_munmap(struct mm_struct *mm, unsigned long addr, size_t len)
 {
 	struct vm_area_struct *mpnt, *prev, **npp, *free, *extra;
 
+    // 检查参数范围
 	if ((addr & ~PAGE_MASK) || addr > TASK_SIZE || len > TASK_SIZE-addr)
 		return -EINVAL;
 
+    // 若映射长度不超过一个页框，错误
 	if ((len = PAGE_ALIGN(len)) == 0)
 		return -EINVAL;
 
@@ -1235,34 +1317,50 @@ int do_munmap(struct mm_struct *mm, unsigned long addr, size_t len)
 	 * every area affected in some way (by any overlap) is put
 	 * on the list.  If nothing is put on, nothing is affected.
 	 */
+    // 查待找删除vma并将前一个vma赋值prev
 	mpnt = find_vma_prev(mm, addr, &prev);
 	if (!mpnt)
 		return 0;
 	/* we have  addr < mpnt->vm_end  */
 
+    // 若销毁部分不在查找到的vma的范围内，失败
 	if (mpnt->vm_start >= addr+len)
 		return 0;
 
 	/* If we'll make "hole", check the vm areas limit */
+    // 若删除部分在vma内，则会使vma的范围产生一个洞，删除后一个vma会变为两个
+    // 此时检查vma总数是否超过最大值
 	if ((mpnt->vm_start < addr && mpnt->vm_end > addr+len)
 	    && mm->map_count >= MAX_MAP_COUNT)
 		return -ENOMEM;
+
+    // 到此处销毁部分与查找到的vma范围有四种关系
+    // 1.addr <= vm_start < addr + len < vm_end
+    // 2.addr <= vm_start < vm_end <= vm_end
+    // 3.vm_start < addr < addr + len < vm_end
+    // 4.vm_start < addr < vm_end < addr + len
 
 	/*
 	 * We may need one additional vma to fix up the mappings ... 
 	 * and this is the last chance for an easy error exit.
 	 */
+    // 额外分配一个vma来映射删除后产生的新的未映射区域
 	extra = kmem_cache_alloc(vm_area_cachep, SLAB_KERNEL);
 	if (!extra)
 		return -ENOMEM;
 
+    // 若prev不存在，则赋值为表头
 	npp = (prev ? &prev->vm_next : &mm->mmap);
 	free = NULL;
+    // 页表上锁，进行删除
 	spin_lock(&mm->page_table_lock);
+    // 将删除部分的vma指针反向，形成free list，free为表头
+    // vma1 -> vma2 <- free1 <- free2 <-...<- free | mpnt -> vma3 ->...
 	for ( ; mpnt && mpnt->vm_start < addr+len; mpnt = *npp) {
 		*npp = mpnt->vm_next;
 		mpnt->vm_next = free;
 		free = mpnt;
+        // 红黑树删除节点
 		rb_erase(&mpnt->vm_rb, &mm->mm_rb);
 	}
 	mm->mmap_cache = NULL;	/* Kill the cache. */
@@ -1274,40 +1372,51 @@ int do_munmap(struct mm_struct *mm, unsigned long addr, size_t len)
 	 * it will put new vm_area_struct(s) into the address space.
 	 * In that case we have to be careful with VM_DENYWRITE.
 	 */
+    // 遍历free list进行删除
 	while ((mpnt = free) != NULL) {
 		unsigned long st, end, size;
 		struct file *file = NULL;
 
 		free = free->vm_next;
 
+        // 确定删除范围
+        // 若[addr,addr+len]超出[vm_start,vm_end]，则st=vm_start,end=vm_end
 		st = addr < mpnt->vm_start ? mpnt->vm_start : addr;
 		end = addr+len;
 		end = end > mpnt->vm_end ? mpnt->vm_end : end;
 		size = end - st;
 
+        // 检查共享进程数
 		if (mpnt->vm_flags & VM_DENYWRITE &&
 		    (st != mpnt->vm_start || end != mpnt->vm_end) &&
 		    (file = mpnt->vm_file) != NULL) {
 			atomic_dec(&file->f_dentry->d_inode->i_writecount);
 		}
+        // 删除vma
 		remove_shared_vm_struct(mpnt);
 		mm->map_count--;
 
+        // 删除指定范围的页框
 		zap_page_range(mm, st, size);
 
 		/*
 		 * Fix the mapping, and free the old area if it wasn't reused.
 		 */
+        // 修正删除后产生的未映射区域
 		extra = unmap_fixup(mm, mpnt, st, size, extra);
+        // 若当前vma映射了文件，则增加共享进程数
 		if (file)
 			atomic_inc(&file->f_dentry->d_inode->i_writecount);
 	}
+    // 检查mm
 	validate_mm(mm);
 
 	/* Release the extra vma struct if it wasn't used */
+    // 若extra不为空，则extra未使用，释放extra
 	if (extra)
 		kmem_cache_free(vm_area_cachep, extra);
 
+    // 释放页表项
 	free_pgtables(mm, prev, addr, addr+len);
 
 	return 0;
@@ -1344,7 +1453,7 @@ unsigned long do_brk(unsigned long addr, unsigned long len)
 	rb_node_t ** rb_link, * rb_parent;
 
 	len = PAGE_ALIGN(len);
-	if (!len)
+	if (!len) 
 		return addr;
 
 	/*
@@ -1450,9 +1559,14 @@ void exit_mmap(struct mm_struct * mm)
 {
 	struct vm_area_struct * mpnt;
 
+    // 释放mm的context和LDT
 	release_segments(mm);
+
+    // 页表上锁
 	spin_lock(&mm->page_table_lock);
+    // 获取vma链表表头
 	mpnt = mm->mmap;
+    // 清空mm结构
 	mm->mmap = mm->mmap_cache = NULL;
 	mm->mm_rb = RB_ROOT;
 	mm->rss = 0;
@@ -1460,31 +1574,41 @@ void exit_mmap(struct mm_struct * mm)
 	mm->total_vm = 0;
 	mm->locked_vm = 0;
 
+    // 刷新cache
 	flush_cache_mm(mm);
+
+    // 清空vma链表
 	while (mpnt) {
 		struct vm_area_struct * next = mpnt->vm_next;
 		unsigned long start = mpnt->vm_start;
 		unsigned long end = mpnt->vm_end;
 		unsigned long size = end - start;
 
+        // 关闭vma
 		if (mpnt->vm_ops) {
 			if (mpnt->vm_ops->close)
 				mpnt->vm_ops->close(mpnt);
 		}
+
+        // 删除vma并释放页框
 		mm->map_count--;
 		remove_shared_vm_struct(mpnt);
 		zap_page_range(mm, start, size);
+        // 将vma指向的file结构清零
 		if (mpnt->vm_file)
 			fput(mpnt->vm_file);
+        // 清空缓存
 		kmem_cache_free(vm_area_cachep, mpnt);
 		mpnt = next;
 	}
+    // 刷新tlb
 	flush_tlb_mm(mm);
 
 	/* This is just debugging */
 	if (mm->map_count)
 		BUG();
 
+    // 清空页表
 	clear_page_tables(mm, FIRST_USER_PGD_NR, USER_PTRS_PER_PGD);
 }
 
