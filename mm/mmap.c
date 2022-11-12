@@ -100,9 +100,9 @@ int vm_enough_memory(long pages)
 }
 
 /* Remove one vm structure from the inode's i_mapping address space. */
-// 从inode映射的vma地址空间中的共享内存部分删除一个vma
+// 从inode映射的vma地址空间中的共享映射删除一个vma
 /**
- * vma:需要删除的vma
+ * vma:需要删除的vma，vma类型：文件共享映射
  * return:void
  */
 static inline void __remove_shared_vm_struct(struct vm_area_struct *vma)
@@ -148,11 +148,11 @@ void lock_vma_mappings(struct vm_area_struct *vma)
 	// vm_file:vma指向的文件
 	// f_dentry:文件的目录项
 	// d_inode:目录项中记录的inode
-	// i_mapping:inode映射的vma地址空间
+	// i_mapping:inode映射的vma，这些vma都是文件映射
 	if (vma->vm_file)
 		mapping = vma->vm_file->f_dentry->d_inode->i_mapping;
 		
-	// 将inode映射的vma共享地址空间上锁
+	// 将inode映射的vma共享映射上锁
 	if (mapping)
 		spin_lock(&mapping->i_shared_lock);
 }
@@ -396,8 +396,8 @@ static struct vm_area_struct * find_vma_prepare(struct mm_struct * mm, unsigned 
     // find_vma_prepare用于查找插入位置的前驱节点，不需要考虑查找节点与它的子节点形成的前驱后继关系
     // 查找插入位置说明目标vma不存在，只需要记录rb_prev的状态
     // rb_prev的状态出现在两种情况下
-    // 1.__rb_link总是向左查找时，rb_prev为空
-    // 2.__rb_link存在向右查找时，rb_prev不为空，值为查找右子树时的根节点
+    // 1.__rb_link总是向左查找时，rb_prev为空，对应find_vma_prev情况1,2
+    // 2.__rb_link存在向右查找时，rb_prev不为空，值为查找右子树时的根节点，对应find_vma_prev情况3,4
 	*pprev = NULL;
     // 若rb_prev为空，则查找到的vma为红黑树中左子树的节点，不是任何一个节点的后继前驱节点
     // 若rb_prev不为空，则vma属于某个节点的右子树，rb_prev记录该节点
@@ -471,6 +471,8 @@ static inline void __vma_link_file(struct vm_area_struct * vma)
 
     // vma映射的文件
 	file = vma->vm_file;
+    // 若file不为空，则vma为文件映射，对文件来说，增加一个映射需要增加该文件的共享映射
+    // 否则为匿名映射，直接返回
 	if (file) {
         // 文件所属的inode
 		struct inode * inode = file->f_dentry->d_inode;
@@ -482,22 +484,28 @@ static inline void __vma_link_file(struct vm_area_struct * vma)
 		if (vma->vm_flags & VM_DENYWRITE)
 			atomic_dec(&inode->i_writecount);
 
-        // inode映射的vma私有地址空间(表头)
+        // inode映射的vma私有映射表头
 		head = &mapping->i_mmap;
-        // 若当前vma的标志位为共享，则设置head为vma共享地址空间(表头)
+        // 若当前vma的标志位为共享，则设置head为vma共享映射表头
 		if (vma->vm_flags & VM_SHARED)
 			head = &mapping->i_mmap_shared;
+        // *head = mapping->i_mmap : mapping->i_mmap_shared
+        // head = &mapping->i_mmap : &mapping->i_mmap_shared
       
 		/* insert vma into inode's share list */
-        // 将表头设置为vma的下一个共享节点
-        // TODO 为什么将next_share设为表头
+        // 插入inode的共享映射链表中，头插
+        // 将vma的下一个共享节点设置为*head
+        // vma->next_share = mapping->i_mmap : mapping->i_mmap_shared
 		if((vma->vm_next_share = *head) != NULL)
-            // 将vma的下一个共享节点的pprev设为自身
+            // mapping->i_mmap->pprev = &vma->next_share
 			(*head)->vm_pprev_share = &vma->vm_next_share;
 
-        // 将vma的pprev设为自身，表头设为vma
+        // 设置表头为vma，表头的pprev指向自身
 		*head = vma;
 		vma->vm_pprev_share = head;
+        // 共享映射的链表连接关系
+        // vma1.next = vma2
+        // vma2.pprev = &vma1.next
 	}
 }
 
@@ -567,7 +575,8 @@ static int vma_merge(struct mm_struct * mm, struct vm_area_struct * prev,
 		goto merge_next;
 	}
 
-    // 若两个vma边界重合，并且前一个vma允许merge
+    // 若前一个vma边界与起始地址重合，并且前一个vma允许merge
+    // [addr,addr+len]表示的区间不一定存在vma
 	if (prev->vm_end == addr && can_vma_merge(prev, vm_flags)) {
 		struct vm_area_struct * next;
 
@@ -594,7 +603,8 @@ static int vma_merge(struct mm_struct * mm, struct vm_area_struct * prev,
 		return 1;
 	}
 
-    // 若边界不重合
+    // 若边界不重合，prev = prev.next
+    // 判断prev后一个vma与[addr,addr+len]是否有边界重合
 	prev = prev->vm_next;
 	if (prev) {
  merge_next:
@@ -602,10 +612,10 @@ static int vma_merge(struct mm_struct * mm, struct vm_area_struct * prev,
 		if (!can_vma_merge(prev, vm_flags))
 			return 0;
 
-        // 若下一个vma的start为合并区间的end，即合并区间不在prev->next里
+        // 若后一个vma的start与合并区间end边界重合，即合并区间不在prev->next里
 		if (end == prev->vm_start) {
 			spin_lock(lock);
-            // 扩展下一个vma的起始地址
+            // 扩展后一个vma的起始地址
 			prev->vm_start = addr;
 			spin_unlock(lock);
 			return 1;
@@ -691,7 +701,7 @@ unsigned long do_mmap_pgoff(struct file * file, unsigned long addr, unsigned lon
 	}
 
 	if (file) {
-        // 若映射的是文件，检查映射类型及权限
+        // 若映射的是文件，检查映射类型及权限(私有or共享)
 		switch (flags & MAP_TYPE) {
 		case MAP_SHARED:
 			if ((prot & PROT_WRITE) && !(file->f_mode & FMODE_WRITE))
@@ -719,7 +729,7 @@ unsigned long do_mmap_pgoff(struct file * file, unsigned long addr, unsigned lon
 			return -EINVAL;
 		}
 	} else {
-        // 若映射的是进程其他段
+        // 如果是匿名映射
 		vm_flags |= VM_SHARED | VM_MAYSHARE;
 		switch (flags & MAP_TYPE) {
 		default:
@@ -737,8 +747,8 @@ unsigned long do_mmap_pgoff(struct file * file, unsigned long addr, unsigned lon
 munmap_back:
     // 查找插入位置
 	vma = find_vma_prepare(mm, addr, &prev, &rb_link, &rb_parent);
-    // 若vma包含addr+len，则销毁[addr,addr+len]的映射
-    // 跳转到munmap_back直到找到合法的插入位置
+    // 若vma与[addr,addr+len]有重合，则销毁[addr,addr+len]的映射
+    // 跳转到munmap_back重复判断，直到[addr,addr+len]中不存在vma映射
 	if (vma && vma->vm_start < addr + len) {
 		if (do_munmap(mm, addr, len))
 			return -ENOMEM;
@@ -759,18 +769,18 @@ munmap_back:
 		return -ENOMEM;
 
 	/* Can we just expand an old anonymous mapping? */
-    // 尝试合并已有的匿名映射
+    // 尝试将[addr,addr+len]与prev、prev.next合并
     // 匿名映射不映射实际的文件，用于映射用户进程请求分配的内存(malloc)
 	if (!file && !(vm_flags & VM_SHARED) && rb_parent)
 		if (vma_merge(mm, prev, rb_parent, addr, addr + len, vm_flags))
-            // 合并成功，跳转到out
+            // 合并成功，映射建立，退出
 			goto out;
 
 	/* Determine the object being mapped and call the appropriate
 	 * specific mapper. the address has already been validated, but
 	 * not unmapped, but the maps are removed from the list.
 	 */
-    // 分配cache内存
+    // 分配vma
 	vma = kmem_cache_alloc(vm_area_cachep, SLAB_KERNEL);
 	if (!vma)
 		return -ENOMEM;
@@ -802,6 +812,7 @@ munmap_back:
             // 文件允许写，则共享vma进程数为1
 			correct_wcount = 1;
 		}
+        // 将vma连接到file
 		vma->vm_file = file;
 		get_file(file);
         // 执行file的映射操作
@@ -1639,7 +1650,7 @@ void __insert_vm_struct(struct mm_struct * mm, struct vm_area_struct * vma)
 	validate_mm(mm);
 }
 
-// 插入vma，实现同__insert_vm_struct
+// 插入vma，__insert_vm_struct加锁版本
 /**
  * mm:被插入的mm_struct
  * vma:插入的vma
