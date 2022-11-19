@@ -59,6 +59,7 @@ struct page *highmem_start_page;
  * a common occurrence (no need to read the page to know
  * that it's zero - better for the cache and memory subsystem).
  */
+// 写时拷贝
 static inline void copy_cow_page(struct page * from, struct page * to, unsigned long address)
 {
 	if (from == ZERO_PAGE(address)) {
@@ -68,18 +69,29 @@ static inline void copy_cow_page(struct page * from, struct page * to, unsigned 
 	copy_user_highpage(to, from, address);
 }
 
+// 指向一个page数组
 mem_map_t * mem_map;
 
 /*
  * Called by TLB shootdown 
  */
+// 释放pte页表项
+/**
+ * pte:释放的pte页表项
+ * return:void
+ */
 void __free_pte(pte_t pte)
 {
+    // 获取pte对应的page
 	struct page *page = pte_page(pte);
+    // 通过页面地址检查page是否合法以及是否为保留页
 	if ((!VALID_PAGE(page)) || PageReserved(page))
 		return;
+    // 若该pte项被写过，则更新对应页面被修改过
 	if (pte_dirty(pte))
-		set_page_dirty(page);		
+		set_page_dirty(page);
+    // 释放页面并放入page cache
+    // 页面放入page cache后，由kswapd线程定期清理不使用的页面，增加空闲页面
 	free_page_and_swap_cache(page);
 }
 
@@ -88,10 +100,16 @@ void __free_pte(pte_t pte)
  * Note: this doesn't free the actual pages themselves. That
  * has been handled earlier when unmapping all the memory regions.
  */
+// 释放pmd页表项
+/**
+ * dir:pmd页表项，对应一个pte页表
+ * return:void
+ */
 static inline void free_one_pmd(pmd_t * dir)
 {
 	pte_t * pte;
 
+    // 检查pmd页表项
 	if (pmd_none(*dir))
 		return;
 	if (pmd_bad(*dir)) {
@@ -99,16 +117,25 @@ static inline void free_one_pmd(pmd_t * dir)
 		pmd_clear(dir);
 		return;
 	}
+    // 获取pmd页表项对应pte页表的第一个pte页表项
 	pte = pte_offset(dir, 0);
+    // 清空pmd页表项(设为全0)
 	pmd_clear(dir);
+    // 释放pte页表项以及对应的页面
 	pte_free(pte);
 }
 
+// 释放pgd页表项
+/**
+ * dir:pgd页表项
+ * return:void
+ */
 static inline void free_one_pgd(pgd_t * dir)
 {
 	int j;
 	pmd_t * pmd;
 
+    // 检查pgd页表项
 	if (pgd_none(*dir))
 		return;
 	if (pgd_bad(*dir)) {
@@ -116,8 +143,10 @@ static inline void free_one_pgd(pgd_t * dir)
 		pgd_clear(dir);
 		return;
 	}
+    // 获取pgd页表项对应的pmd页表的第一个pmd页表项
 	pmd = pmd_offset(dir, 0);
 	pgd_clear(dir);
+    // 循环释放pmd页表
 	for (j = 0; j < PTRS_PER_PMD ; j++) {
 		prefetchw(pmd+j+(PREFETCH_STRIDE/16));
 		free_one_pmd(pmd+j);
@@ -128,11 +157,20 @@ static inline void free_one_pgd(pgd_t * dir)
 /* Low and high watermarks for page table cache.
    The system should try to have pgt_water[0] <= cache elements <= pgt_water[1]
  */
+// 页表缓存的最小值和最大值，用于内存调节
 int pgt_cache_water[2] = { 25, 50 };
 
 /* Returns the number of pages freed */
+// 检查页表缓存
+/**
+ * void
+ * return:1:成功，0:失败
+ */
 int check_pgt_cache(void)
 {
+    // 检查pgd_quicklist、pmd_quicklist、pte_quicklist中的个数
+    // quicklist是一种缓存，pgd_quicklist、pmd_quicklist、pte_quicklist是对应页表的缓存
+    // 若缓存超过最大值，返回0
 	return do_check_pgt_cache(pgt_cache_water[0], pgt_cache_water[1]);
 }
 
@@ -141,12 +179,22 @@ int check_pgt_cache(void)
  * This function clears all user-level page tables of a process - this
  * is needed by execve(), so that old pages aren't in the way.
  */
+// 清除mm的pgd页表项
+/**
+ * mm:mm_struct
+ * first:pgd页表偏移量
+ * nr:清除的pgd页表项个数
+ * return:void
+ */
 void clear_page_tables(struct mm_struct *mm, unsigned long first, int nr)
 {
+    // 获取mm的pgd页表
 	pgd_t * page_dir = mm->pgd;
 
 	spin_lock(&mm->page_table_lock);
+    // 移动地址到清除位置
 	page_dir += first;
+    // 循环清除pgd页表项
 	do {
 		free_one_pgd(page_dir);
 		page_dir++;
@@ -154,6 +202,7 @@ void clear_page_tables(struct mm_struct *mm, unsigned long first, int nr)
 	spin_unlock(&mm->page_table_lock);
 
 	/* keep the page table cache within bounds */
+    // 检查页表缓存
 	check_pgt_cache();
 }
 
@@ -171,14 +220,24 @@ void clear_page_tables(struct mm_struct *mm, unsigned long first, int nr)
  * dst->page_table_lock is held on entry and exit,
  * but may be dropped within pmd_alloc() and pte_alloc().
  */
+// 将一个vma从源mm复制到目标mm TODO
+/**
+ * dst:目标mm
+ * src:源mm
+ * vma:复制的vma
+ * return:0:成功,非0:失败
+ */
 int copy_page_range(struct mm_struct *dst, struct mm_struct *src,
 			struct vm_area_struct *vma)
 {
 	pgd_t * src_pgd, * dst_pgd;
+    // address为线性地址
 	unsigned long address = vma->vm_start;
 	unsigned long end = vma->vm_end;
+    // cow标志
 	unsigned long cow = (vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
 
+    // 获取pgd页表项
 	src_pgd = pgd_offset(src, address)-1;
 	dst_pgd = pgd_offset(dst, address)-1;
 
@@ -188,7 +247,7 @@ int copy_page_range(struct mm_struct *dst, struct mm_struct *src,
 		src_pgd++; dst_pgd++;
 		
 		/* copy_pmd_range */
-		
+		// 检查pmd页表
 		if (pgd_none(*src_pgd))
 			goto skip_copy_pmd_range;
 		if (pgd_bad(*src_pgd)) {
@@ -200,16 +259,20 @@ skip_copy_pmd_range:	address = (address + PGDIR_SIZE) & PGDIR_MASK;
 			continue;
 		}
 
+        // 获取pmd页表项
 		src_pmd = pmd_offset(src_pgd, address);
+        // 分配一个pmd页表项
+        // TODO
 		dst_pmd = pmd_alloc(dst, dst_pgd, address);
 		if (!dst_pmd)
 			goto nomem;
 
+        // 对每个pmd页表项循环复制pte页表项
 		do {
 			pte_t * src_pte, * dst_pte;
 		
 			/* copy_pte_range */
-		
+		    // 检查pte页表
 			if (pmd_none(*src_pmd))
 				goto skip_copy_pte_range;
 			if (pmd_bad(*src_pmd)) {
@@ -221,7 +284,10 @@ skip_copy_pte_range:		address = (address + PMD_SIZE) & PMD_MASK;
 				goto cont_copy_pmd_range;
 			}
 
+            // 获取pte页表项
 			src_pte = pte_offset(src_pmd, address);
+            // 分配一个pte页表项
+            // TODO
 			dst_pte = pte_alloc(dst, dst_pmd, address);
 			if (!dst_pte)
 				goto nomem;
@@ -232,13 +298,15 @@ skip_copy_pte_range:		address = (address + PMD_SIZE) & PMD_MASK;
 				struct page *ptepage;
 				
 				/* copy_one_pte */
-
+                // 循环复制页面
 				if (pte_none(pte))
 					goto cont_copy_pte_range_noset;
 				if (!pte_present(pte)) {
+                    // 若当前页面不在内存中，增加swap区中src页面的映射计数
 					swap_duplicate(pte_to_swp_entry(pte));
 					goto cont_copy_pte_range;
 				}
+                // 获取对应的page
 				ptepage = pte_page(pte);
 				if ((!VALID_PAGE(ptepage)) || 
 				    PageReserved(ptepage))
@@ -254,18 +322,23 @@ skip_copy_pte_range:		address = (address + PMD_SIZE) & PMD_MASK;
 				if (vma->vm_flags & VM_SHARED)
 					pte = pte_mkclean(pte);
 				pte = pte_mkold(pte);
+                // 增加page的count计数
 				get_page(ptepage);
 				dst->rss++;
 
+                // 设置dst_pte指针指向pte
 cont_copy_pte_range:		set_pte(dst_pte, pte);
+                // 线性地址移动到下一页
 cont_copy_pte_range_noset:	address += PAGE_SIZE;
 				if (address >= end)
 					goto out_unlock;
+                // 移动pte页表项
 				src_pte++;
 				dst_pte++;
 			} while ((unsigned long)src_pte & PTE_TABLE_MASK);
 			spin_unlock(&src->page_table_lock);
-		
+
+            // 移动pmd页表项
 cont_copy_pmd_range:	src_pmd++;
 			dst_pmd++;
 		} while ((unsigned long)src_pmd & PMD_TABLE_MASK);
@@ -281,72 +354,122 @@ nomem:
 /*
  * Return indicates whether a page was freed so caller can adjust rss
  */
+// 检查pte页表项是否为空
+/**
+ * page:pte页表项
+ * return:void
+ */
 static inline void forget_pte(pte_t page)
 {
+    // 判断pte页表项是否为空，为空则输出调试信息
 	if (!pte_none(page)) {
 		printk("forget_pte: old mapping existed!\n");
 		BUG();
 	}
 }
 
+// 释放pte页表中[address,address+size]范围的页表项
+/**
+ * tlb:mmu_gather_t = mm_struct
+ * pmd:pmd页表项
+ * address:起始地址
+ * size:释放长度
+ * return:释放页面个数
+ */
 static inline int zap_pte_range(mmu_gather_t *tlb, pmd_t * pmd, unsigned long address, unsigned long size)
 {
 	unsigned long offset;
 	pte_t * ptep;
+    // 记录释放页面个数
 	int freed = 0;
 
+    // 若pmd页表项为空
 	if (pmd_none(*pmd))
 		return 0;
+    // 若pte页表错误，则清空后返回0
 	if (pmd_bad(*pmd)) {
 		pmd_ERROR(*pmd);
 		pmd_clear(pmd);
 		return 0;
 	}
+
+    // 获取起始pte页表项
 	ptep = pte_offset(pmd, address);
+    // 获取相对于pmd页表基址的偏移量
 	offset = address & ~PMD_MASK;
+    // 若长度非法，则重新设置
 	if (offset + size > PMD_SIZE)
 		size = PMD_SIZE - offset;
+    // 将size与页面对齐，调整单位为页
 	size &= PAGE_MASK;
+
+    // offset以页为单位递增，ptep以pte页表项为单位递增
 	for (offset=0; offset < size; ptep++, offset += PAGE_SIZE) {
 		pte_t pte = *ptep;
+        // 若pte为空
 		if (pte_none(pte))
 			continue;
+        // 若pte的页面present标志为1
+        // present位表示该页面是否存在于物理内存中，为0时访问该页会产生缺页中断
 		if (pte_present(pte)) {
+            // 获取对应的page
 			struct page *page = pte_page(pte);
+            // 若当前page合法且不是保留页，增加计数
 			if (VALID_PAGE(page) && !PageReserved(page))
 				freed ++;
 			/* This will eventually call __free_pte on the pte. */
+            // 调用tlb_remove_page删除page
 			tlb_remove_page(tlb, ptep, address + offset);
 		} else {
+            // 若该页不存在物理内存中，释放swap分区和cache中的页面
+            // swp_entry_t与pte通过pte_to_swp_entry()转换
 			free_swap_and_cache(pte_to_swp_entry(pte));
 			pte_clear(ptep);
 		}
 	}
 
+    // 返回释放页面个数
 	return freed;
 }
 
+// 释放pmd页表中[address,address+size]范围的页表项
+/**
+ * tlb:mm_struct
+ * dir:pgd页表项
+ * address:起始地址
+ * size:释放长度
+ * return:释放页面个数
+ */
 static inline int zap_pmd_range(mmu_gather_t *tlb, pgd_t * dir, unsigned long address, unsigned long size)
 {
 	pmd_t * pmd;
 	unsigned long end;
 	int freed;
 
+    // 检查pgd页表项
 	if (pgd_none(*dir))
 		return 0;
+    // 检查pmd页表
 	if (pgd_bad(*dir)) {
 		pgd_ERROR(*dir);
 		pgd_clear(dir);
 		return 0;
 	}
+
+    // 获取起始位置pmd
 	pmd = pmd_offset(dir, address);
 	end = address + size;
+    // 检查并设置结束地址
 	if (end > ((address + PGDIR_SIZE) & PGDIR_MASK))
 		end = ((address + PGDIR_SIZE) & PGDIR_MASK);
+
 	freed = 0;
 	do {
+        // 调用zap_pte_range删除
 		freed += zap_pte_range(tlb, pmd, address, end - address);
-		address = (address + PMD_SIZE) & PMD_MASK; 
+        // address以pmd为单位递增并对齐
+		address = (address + PMD_SIZE) & PMD_MASK;
+        // 更新pmd页表项，与address一一对应
 		pmd++;
 	} while (address < end);
 	return freed;
@@ -355,13 +478,22 @@ static inline int zap_pmd_range(mmu_gather_t *tlb, pgd_t * dir, unsigned long ad
 /*
  * remove user pages in a given range.
  */
+// 删除pgd页表中[address,address+size]范围的页表项
+/**
+ * mm:mm_struct
+ * address:起始地址
+ * size:删除长度
+ * return:void
+ */
 void zap_page_range(struct mm_struct *mm, unsigned long address, unsigned long size)
 {
 	mmu_gather_t *tlb;
 	pgd_t * dir;
 	unsigned long start = address, end = address + size;
+    // 记录页面释放个数
 	int freed = 0;
 
+    // 获取pgd页表中删除部分的起始页表项
 	dir = pgd_offset(mm, address);
 
 	/*
@@ -378,6 +510,7 @@ void zap_page_range(struct mm_struct *mm, unsigned long address, unsigned long s
 	tlb = tlb_gather_mmu(mm);
 
 	do {
+        // 调用zap_pmd_range删除，增加计数
 		freed += zap_pmd_range(tlb, dir, address, end - address);
 		address = (address + PGDIR_SIZE) & PGDIR_MASK;
 		dir++;
@@ -390,6 +523,7 @@ void zap_page_range(struct mm_struct *mm, unsigned long address, unsigned long s
 	 * Update rss for the mm_struct (not necessarily current->mm)
 	 * Notice that rss is an unsigned long.
 	 */
+    // 根据释放页面数更新rss
 	if (mm->rss > freed)
 		mm->rss -= freed;
 	else
@@ -400,28 +534,40 @@ void zap_page_range(struct mm_struct *mm, unsigned long address, unsigned long s
 /*
  * Do a quick page-table lookup for a single page. 
  */
+// 根据线性地址查询页面
+/**
+ * mm:mm_struct
+ * address:线性地址
+ * write:是否写页面
+ * return:查询到的页面page
+ */
 static struct page * follow_page(struct mm_struct *mm, unsigned long address, int write) 
 {
 	pgd_t *pgd;
 	pmd_t *pmd;
 	pte_t *ptep, pte;
 
+    // 获取pgd页表项并检查
 	pgd = pgd_offset(mm, address);
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		goto out;
 
+    // 获取pmd页表项并检查
 	pmd = pmd_offset(pgd, address);
 	if (pmd_none(*pmd) || pmd_bad(*pmd))
 		goto out;
 
+    // 获取pte页表项并检查
 	ptep = pte_offset(pmd, address);
 	if (!ptep)
 		goto out;
 
 	pte = *ptep;
+    // 若页面存在内存中
 	if (pte_present(pte)) {
 		if (!write ||
 		    (pte_write(pte) && pte_dirty(pte)))
+            // 返回对应的page
 			return pte_page(pte);
 	}
 
@@ -434,7 +580,12 @@ out:
  * it?  This may become more complex in the future if we start dealing
  * with IO-aperture pages in kiobufs.
  */
-
+// 检查page是否合法
+/**
+ * page:page
+ * page:合法返回page，否则返回0
+ * return:page
+ */
 static inline struct page * get_page_map(struct page *page)
 {
 	if (!VALID_PAGE(page))
@@ -449,6 +600,7 @@ static inline struct page * get_page_map(struct page *page)
  * Accessing a VM_IO area is even more dangerous, therefore the function
  * fails if pages is != NULL and a VM_IO area is found.
  */
+// 获取用户空间中的页面，若不存在，则将用户空间中的页面通过缺页中断移到内存中
 int get_user_pages(struct task_struct *tsk, struct mm_struct *mm, unsigned long start,
 		int len, int write, int force, struct page **pages, struct vm_area_struct **vmas)
 {
@@ -742,71 +894,116 @@ int unlock_kiovec(int nr, struct kiobuf *iovec[])
 	return 0;
 }
 
+// 清空部分pte页表映射
+/**
+ * pte:pte页表项
+ * address:线性地址
+ * size:映射长度
+ * prot:访问保护
+ * return:void
+ */
 static inline void zeromap_pte_range(pte_t * pte, unsigned long address,
                                      unsigned long size, pgprot_t prot)
 {
 	unsigned long end;
 
+    // 截取线性地址到pte页表部分
 	address &= ~PMD_MASK;
 	end = address + size;
+    // 检查并设置end地址
 	if (end > PMD_SIZE)
 		end = PMD_SIZE;
+
 	do {
+        // 以address地址和prot标志创建一个空pte页表项
 		pte_t zero_pte = pte_wrprotect(mk_pte(ZERO_PAGE(address), prot));
+        // 清空旧页表项
 		pte_t oldpage = ptep_get_and_clear(pte);
+        // *pte = zero_pte
 		set_pte(pte, zero_pte);
 		forget_pte(oldpage);
+        // 移动地址和页表项
 		address += PAGE_SIZE;
 		pte++;
 	} while (address && (address < end));
 }
 
+// 清空部分pmd页表映射
+/**
+ * mm:mm_struct
+ * pmd:pmd页表项
+ * address:线性地址
+ * size:映射长度
+ * prot:访问标志
+ * return:0:成功，非0:失败
+ */
 static inline int zeromap_pmd_range(struct mm_struct *mm, pmd_t * pmd, unsigned long address,
                                     unsigned long size, pgprot_t prot)
 {
 	unsigned long end;
 
+    // 地址处理
 	address &= ~PGDIR_MASK;
 	end = address + size;
 	if (end > PGDIR_SIZE)
 		end = PGDIR_SIZE;
+
 	do {
+        // 分配一个address对应的pte页表项，连接到pmd
 		pte_t * pte = pte_alloc(mm, pmd, address);
 		if (!pte)
 			return -ENOMEM;
+        // 以分配的pte页表项为起始，调用zeromap_pte_range清空
 		zeromap_pte_range(pte, address, end - address, prot);
+        // 移动地址和页表项
 		address = (address + PMD_SIZE) & PMD_MASK;
 		pmd++;
 	} while (address && (address < end));
 	return 0;
 }
 
+// 清空部分页表映射
+/**
+ * address:线性地址
+ * size:映射长度
+ * prot:访问标志
+ * return:0:成功，非0:失败
+ */
 int zeromap_page_range(unsigned long address, unsigned long size, pgprot_t prot)
 {
 	int error = 0;
 	pgd_t * dir;
 	unsigned long beg = address;
 	unsigned long end = address + size;
+    // 获取当前进程的mm_struct
 	struct mm_struct *mm = current->mm;
 
+    // 获取mm的pgd页表项
 	dir = pgd_offset(mm, address);
+    // 刷新cache
 	flush_cache_range(mm, beg, end);
 	if (address >= end)
 		BUG();
 
 	spin_lock(&mm->page_table_lock);
 	do {
+        // 以address分配一个pmd页表项
 		pmd_t *pmd = pmd_alloc(mm, dir, address);
 		error = -ENOMEM;
 		if (!pmd)
-			break;
+			break; // 若错误，则退出，error = -ENOMEM
+
+        // 以分配的pmd页表项为起始，调用zeromap_pmd_range清空
 		error = zeromap_pmd_range(mm, pmd, address, end - address, prot);
 		if (error)
-			break;
+			break; // 非0时错误，退出
+
+        // 移动页表项和地址
 		address = (address + PGDIR_SIZE) & PGDIR_MASK;
 		dir++;
 	} while (address && (address < end));
 	spin_unlock(&mm->page_table_lock);
+    // 刷新tlb
 	flush_tlb_range(mm, beg, end);
 	return error;
 }
@@ -816,45 +1013,79 @@ int zeromap_page_range(unsigned long address, unsigned long size, pgprot_t prot)
  * mappings are removed. any references to nonexistent pages results
  * in null mappings (currently treated as "copy-on-access")
  */
+// 将物理地址映射到被请求的页面，原来的映射被清空
+/**
+ * pte:pte页表项
+ * address:线性地址
+ * size:映射长度
+ * phys_addr:物理地址
+ * prot:访问标志
+ * return:void
+ */
 static inline void remap_pte_range(pte_t * pte, unsigned long address, unsigned long size,
 	unsigned long phys_addr, pgprot_t prot)
 {
 	unsigned long end;
 
+    // 地址处理
 	address &= ~PMD_MASK;
 	end = address + size;
 	if (end > PMD_SIZE)
 		end = PMD_SIZE;
+
 	do {
 		struct page *page;
 		pte_t oldpage;
+        // 将原pte页表项清空
 		oldpage = ptep_get_and_clear(pte);
 
+        // __va将物理地址转换为线性地址
+        // virt_to_page返回线性地址对应的页面
 		page = virt_to_page(__va(phys_addr));
+        // 检查页面，若不合法或者页面是保留页
 		if ((!VALID_PAGE(page)) || PageReserved(page))
+            // mk_pte_phys以物理地址创建一个pte页表项
+            // pte指向该页表项
  			set_pte(pte, mk_pte_phys(phys_addr, prot));
+
 		forget_pte(oldpage);
+        // 移动地址和页表项
 		address += PAGE_SIZE;
 		phys_addr += PAGE_SIZE;
 		pte++;
 	} while (address && (address < end));
 }
 
+// 将物理地址映射到被请求的页面，原来的映射被清空
+/**
+ * mm:mm_struct
+ * pmd:pmd页表项
+ * address:线性地址
+ * size:映射长度
+ * phys_addr:物理地址
+ * prot:访问标志
+ * return:0:成功，非0:失败
+ */
 static inline int remap_pmd_range(struct mm_struct *mm, pmd_t * pmd, unsigned long address, unsigned long size,
 	unsigned long phys_addr, pgprot_t prot)
 {
 	unsigned long end;
 
+    // 地址处理
 	address &= ~PGDIR_MASK;
 	end = address + size;
 	if (end > PGDIR_SIZE)
 		end = PGDIR_SIZE;
 	phys_addr -= address;
+
 	do {
+        // 以address分配一个pte页表项作为起始pte页表项
 		pte_t * pte = pte_alloc(mm, pmd, address);
 		if (!pte)
 			return -ENOMEM;
+        // 调用remap_pte_range处理
 		remap_pte_range(pte, address, end - address, address + phys_addr, prot);
+        // 移动地址和页表项
 		address = (address + PMD_SIZE) & PMD_MASK;
 		pmd++;
 	} while (address && (address < end));
@@ -862,33 +1093,51 @@ static inline int remap_pmd_range(struct mm_struct *mm, pmd_t * pmd, unsigned lo
 }
 
 /*  Note: this is only safe if the mm semaphore is held when called. */
+// 将物理地址映射到被请求的页面，原来的映射被清空
+/**
+ * from:起始地址
+ * phys_addr:物理地址
+ * size:映射长度
+ * prot:访问标志
+ * return:0:成功，非0:失败
+ */
 int remap_page_range(unsigned long from, unsigned long phys_addr, unsigned long size, pgprot_t prot)
 {
 	int error = 0;
 	pgd_t * dir;
 	unsigned long beg = from;
 	unsigned long end = from + size;
+    // 获取当前进程mm_struct
 	struct mm_struct *mm = current->mm;
 
 	phys_addr -= from;
+    // 获取pgd页表项
 	dir = pgd_offset(mm, from);
+
+    // 刷新cache并检查地址
 	flush_cache_range(mm, beg, end);
 	if (from >= end)
 		BUG();
 
 	spin_lock(&mm->page_table_lock);
 	do {
+        // 以from分配一个pmd页表项作为起始页表项
 		pmd_t *pmd = pmd_alloc(mm, dir, from);
 		error = -ENOMEM;
 		if (!pmd)
 			break;
+
+        // 调用remap_pmd_range处理
 		error = remap_pmd_range(mm, pmd, from, end - from, phys_addr + from, prot);
 		if (error)
 			break;
+
+        // 移动地址和页表项
 		from = (from + PGDIR_SIZE) & PGDIR_MASK;
 		dir++;
 	} while (from && (from < end));
 	spin_unlock(&mm->page_table_lock);
+    // 刷新tlb
 	flush_tlb_range(mm, beg, end);
 	return error;
 }
@@ -901,8 +1150,17 @@ int remap_page_range(unsigned long from, unsigned long phys_addr, unsigned long 
  *
  * We hold the mm semaphore for reading and vma->vm_mm->page_table_lock
  */
+// 设置一个新的pte页表，同时刷新tlb和mmu cache
+/**
+ * vma:vma，用于tlb刷新
+ * address:线性地址
+ * page_table:pte页表项指针
+ * entry:pte页表项
+ * return:void
+ */
 static inline void establish_pte(struct vm_area_struct * vma, unsigned long address, pte_t *page_table, pte_t entry)
 {
+    // *page_table = entry
 	set_pte(page_table, entry);
 	flush_tlb_page(vma, address);
 	update_mmu_cache(vma, address, entry);
@@ -1389,12 +1647,21 @@ int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct * vma,
  * On a two-level page table, this ends up actually being entirely
  * optimized away.
  */
+// 分配一个pmd页表项
+/**
+ * mm:mm_struct
+ * pgd:pgd页表项
+ * address:线性地址
+ * return:分配的pmd页表项
+ */
 pmd_t *__pmd_alloc(struct mm_struct *mm, pgd_t *pgd, unsigned long address)
 {
 	pmd_t *new;
 
 	/* "fast" allocation can happen without dropping the lock.. */
+    // 先调用pmd_alloc_one_fast分配
 	new = pmd_alloc_one_fast(mm, address);
+    // 分配失败，调用pmd_alloc_one分配
 	if (!new) {
 		spin_unlock(&mm->page_table_lock);
 		new = pmd_alloc_one(mm, address);
@@ -1406,13 +1673,16 @@ pmd_t *__pmd_alloc(struct mm_struct *mm, pgd_t *pgd, unsigned long address)
 		 * Because we dropped the lock, we should re-check the
 		 * entry, as somebody else could have populated it..
 		 */
+        // 再次检查pgd，若不合法，则释放分配的pmd页表项
 		if (!pgd_none(*pgd)) {
 			pmd_free(new);
 			goto out;
 		}
 	}
+    // 将pmd页表项连接到pgd对应的pmd页表
 	pgd_populate(mm, pgd, new);
 out:
+    // 返回指定的页表项
 	return pmd_offset(pgd, address);
 }
 
@@ -1422,14 +1692,24 @@ out:
  * We've already handled the fast-path in-line, and we own the
  * page table lock.
  */
+// 分配一个pte页表项并返回
+/**
+ * mm:mm_struct
+ * pmd:pte页表对应的pmd页表项
+ * address:线性地址
+ * return:分配的pte页表项
+ */
 pte_t *pte_alloc(struct mm_struct *mm, pmd_t *pmd, unsigned long address)
 {
 	if (pmd_none(*pmd)) {
 		pte_t *new;
 
 		/* "fast" allocation can happen without dropping the lock.. */
+        // 先调用pte_alloc_fast分配
 		new = pte_alloc_one_fast(mm, address);
+        // 若分配失败，调用pte_alloc_one分配
 		if (!new) {
+            // 加锁分配
 			spin_unlock(&mm->page_table_lock);
 			new = pte_alloc_one(mm, address);
 			spin_lock(&mm->page_table_lock);
@@ -1440,30 +1720,45 @@ pte_t *pte_alloc(struct mm_struct *mm, pmd_t *pmd, unsigned long address)
 			 * Because we dropped the lock, we should re-check the
 			 * entry, as somebody else could have populated it..
 			 */
+            // 再次检查pmd，若不合法，释放分配的pte页表项
 			if (!pmd_none(*pmd)) {
 				pte_free(new);
 				goto out;
 			}
 		}
+        // 将pte页表项连接到pmd对应的pte页表中
 		pmd_populate(mm, pmd, new);
 	}
 out:
 	return pte_offset(pmd, address);
 }
 
+// 将用户空间中的页面移动到内存中
+/**
+ * addr:起始线性地址
+ * end:结束线性地址
+ * return:0:成功,-1:失败
+ */
 int make_pages_present(unsigned long addr, unsigned long end)
 {
 	int ret, len, write;
 	struct vm_area_struct * vma;
 
+    // 查找addr所在的vma
 	vma = find_vma(current->mm, addr);
+    // write记录vma是否可写
 	write = (vma->vm_flags & VM_WRITE) != 0;
+    // 检查地址
 	if (addr >= end)
 		BUG();
 	if (end > vma->vm_end)
 		BUG();
+
+    // 计算addr和end之间的页面数
 	len = (end+PAGE_SIZE-1)/PAGE_SIZE-addr/PAGE_SIZE;
+    // 获取用户空间中的页面
 	ret = get_user_pages(current, current->mm, addr,
 			len, write, 0, NULL, NULL);
+    // 返回是否获取成功
 	return ret == len ? 0 : -1;
 }
