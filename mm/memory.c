@@ -1366,20 +1366,33 @@ void swapin_readahead(swp_entry_t entry)
  * We hold the mm semaphore and the page_table_lock on entry and
  * should release the pagetable lock on exit..
  */
+// 将page从swap区调入
+/**
+ * mm：mm_struct
+ * vma：address所在的vma
+ * address：线性区地址
+ * page_table：pte页表
+ * orig_pte：pte页表项
+ * write_access：读写权限
+ * return：后续处理标志
+ */
 static int do_swap_page(struct mm_struct * mm,
 	struct vm_area_struct * vma, unsigned long address,
 	pte_t * page_table, pte_t orig_pte, int write_access)
 {
 	struct page *page;
+    // 将pte转换为swp_entry
 	swp_entry_t entry = pte_to_swp_entry(orig_pte);
 	pte_t pte;
 	int ret = 1;
 
 	spin_unlock(&mm->page_table_lock);
+    // 查看swap cache，若没有，则调用read_swap_cache_async调入
 	page = lookup_swap_cache(entry);
 	if (!page) {
 		swapin_readahead(entry);
 		page = read_swap_cache_async(entry);
+        // 若返回为空，则直接返回，错误
 		if (!page) {
 			/*
 			 * Back out if somebody else faulted in this pte while
@@ -1393,6 +1406,7 @@ static int do_swap_page(struct mm_struct * mm,
 		}
 
 		/* Had to read the page from swap area: Major fault */
+        // 调入页面后更新相关结构
 		ret = 2;
 	}
 
@@ -1413,12 +1427,14 @@ static int do_swap_page(struct mm_struct * mm,
 	}
 
 	/* The page isn't present yet, go ahead with the fault. */
-		
+
+    // 调入后不在swap区内，删除swp_entry
 	swap_free(entry);
 	if (vm_swap_full())
 		remove_exclusive_swap_page(page);
 
 	mm->rss++;
+    // 传入page和prot，创建pte页表项
 	pte = mk_pte(page, vma->vm_page_prot);
 	if (write_access && can_share_swap_page(page))
 		pte = pte_mkdirty(pte_mkwrite(pte));
@@ -1426,6 +1442,7 @@ static int do_swap_page(struct mm_struct * mm,
 
 	flush_page_to_ram(page);
 	flush_icache_page(vma, page);
+    // 将pte页表项加入pte页表
 	set_pte(page_table, pte);
 
 	/* No need to invalidate - it was non-present before */
